@@ -1,0 +1,10 @@
+{
+  "delay": 100,
+  "channels": [
+    {
+      "name": "SchaffrillasProductions",
+      "url": "https://www.youtube.com/@SchaffrillasProductions" ,
+      "fetch_only_new": true
+    }
+  ]
+}
