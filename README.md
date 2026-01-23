@@ -46,11 +46,11 @@ Create a file named config.json:
   "delay": 10,
   "channels": [
     {
-      "url": "https://www.youtube.com/@GameGrumps",
+      "url": "https://www.youtube.com/@Chanel1",
       "fetch_only_new": true
     },
     {
-      "url": "https://www.youtube.com/@markiplier",
+      "url": "https://www.youtube.com/@Chanel2",
       "fetch_only_new": true
     }
   ]
