@@ -16,8 +16,9 @@ else
     CONFIG_FILE="$SCRIPT_DIR/config.json"
 fi
 
-YT_DLP=$(command -v yt-dlp)
-JQ=$(command -v jq)
+# ---- Logging helper ----
+log()  { echo "[$(date '+%H:%M:%S')] $*"; }
+logn() { echo "$*"; }  # no timestamp, for headers/separators
 
 # ---- Dependency checks ----
 for cmd in yt-dlp jq; do
@@ -29,20 +30,33 @@ done
 
 [ ! -f "$CONFIG_FILE" ] && echo "❌ Config file not found: $CONFIG_FILE" && exit 1
 
-echo "📋 Loading configuration from: $CONFIG_FILE"
+RUN_START=$(date +%s)
+RUN_TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+
+logn "========================================"
+log "🚀 Run started: $RUN_TIMESTAMP"
+log "📋 Loading configuration from: $CONFIG_FILE"
 
 # ---- Read configuration from the config file ----
-ROOT_DIR=$(jq -r '.root_directory // "/media/monoar2/VIDEO REPO/services/media"' "$CONFIG_FILE")
-DELAY=$(jq -r '.delay // 2' "$CONFIG_FILE")  # Reduced delay
+ROOT_DIR=$(jq -r '.root_directory // "/media/youtube"' "$CONFIG_FILE")
+DELAY=$(jq -r '.delay // 2' "$CONFIG_FILE")
 CREATE_NFO_FILES=$(jq -r '.create_nfo_files // false' "$CONFIG_FILE")
 FORCE_CODEC_COMPATIBILITY=$(jq -r '.force_codec_compatibility // false' "$CONFIG_FILE")
 MAX_VIDEOS_PER_CHANNEL=$(jq -r '.max_videos_per_channel // 50' "$CONFIG_FILE")
-DOWNLOAD_SUBTITLES=$(jq -r '.download_subtitles // false' "$CONFIG_FILE")  # Disabled for speed
+DOWNLOAD_SUBTITLES=$(jq -r '.download_subtitles // false' "$CONFIG_FILE")
 VIDEO_QUALITY=$(jq -r '.video_quality // "best[height<=720]"' "$CONFIG_FILE")
 SKIP_FAILED=$(jq -r '.skip_failed_channels // true' "$CONFIG_FILE")
 OUTPUT_TEMPLATE=$(jq -r '.output_template // "Season 01/%(upload_date)s - %(title)s [%(id)s].%(ext)s"' "$CONFIG_FILE")
-USE_COOKIES=$(jq -r '.use_cookies // true' "$CONFIG_FILE")  # Enabled for speed
+USE_COOKIES=$(jq -r '.use_cookies // true' "$CONFIG_FILE")
 COOKIES_FILE=$(jq -r '.cookies_file // "cookies.txt"' "$CONFIG_FILE")
+
+# ---- Stall detection settings (override in config.json if needed) ----
+# stall_timeout     : seconds without download progress before declaring a stall
+# stall_retry_wait  : seconds to wait after a stall before retrying
+# stall_max_retries : max retry attempts per channel before giving up
+STALL_TIMEOUT=$(jq -r '.stall_timeout // 300' "$CONFIG_FILE")
+STALL_RETRY_WAIT=$(jq -r '.stall_retry_wait // 600' "$CONFIG_FILE")
+STALL_MAX_RETRIES=$(jq -r '.stall_max_retries // 3' "$CONFIG_FILE")
 
 # ---- Fix cookie file path ----
 if [ "$USE_COOKIES" = "true" ]; then
@@ -52,21 +66,22 @@ if [ "$USE_COOKIES" = "true" ]; then
     fi
 fi
 
-echo "📁 Root directory: $ROOT_DIR"
-echo "⏱️  Delay between channels: ${DELAY}s"
-echo "🎬 Max videos per channel: $MAX_VIDEOS_PER_CHANNEL"
-echo "📺 Video quality: $VIDEO_QUALITY"
-echo "🔄 Skip failed channels: $SKIP_FAILED"
-echo "🍪 Use cookies: $USE_COOKIES"
-echo "⚡ OPTIMIZED FOR SPEED"
+log "📁 Root directory: $ROOT_DIR"
+log "⏱️  Delay between channels: ${DELAY}s"
+log "🎬 Max videos per channel: $MAX_VIDEOS_PER_CHANNEL"
+log "📺 Video quality: $VIDEO_QUALITY"
+log "🔄 Skip failed channels: $SKIP_FAILED"
+log "🍪 Use cookies: $USE_COOKIES"
+log "🛡️  Stall detection: timeout=${STALL_TIMEOUT}s | retry_wait=${STALL_RETRY_WAIT}s | max_retries=$STALL_MAX_RETRIES"
+log "⚡ OPTIMIZED FOR SPEED"
 
 # Check if cookies file exists
 if [ "$USE_COOKIES" = "true" ]; then
     if [ -f "$COOKIES_FILE" ]; then
-        echo "✅ Cookies file found: $COOKIES_FILE"
+        log "✅ Cookies file found: $COOKIES_FILE"
     else
-        echo "❌ Cookies file not found: $COOKIES_FILE"
-        echo "   Downloading without cookies (may be slower)"
+        log "❌ Cookies file not found: $COOKIES_FILE"
+        log "   Downloading without cookies (may be slower)"
         USE_COOKIES="false"
     fi
 fi
@@ -79,8 +94,8 @@ cd "$ROOT_DIR" || {
 }
 
 # ---- Update yt-dlp to nightly ----
-echo "🔄 Updating yt-dlp to nightly build (for better speed)..."
-$YT_DLP --update-to nightly --no-warnings 2>/dev/null || echo "⚠️ yt-dlp update may have failed, continuing..."
+log "🔄 Updating yt-dlp to nightly build..."
+yt-dlp --update-to nightly --no-warnings 2>/dev/null || log "⚠️ yt-dlp update may have failed, continuing..."
 
 # ---- Get channels array ----
 CHANNEL_COUNT=$(jq '.channels | length' "$CONFIG_FILE")
@@ -97,6 +112,101 @@ SUCCESS_COUNT=0
 FAILED_COUNT=0
 SKIPPED_COUNT=0
 TOTAL_NEW_VIDEOS=0
+RATE_LIMIT_EVENTS=0
+
+# Per-channel result tracking (parallel arrays)
+declare -a CH_NAMES CH_VIDEOS CH_STATUS CH_ELAPSED CH_SIZE CH_STALLS
+
+# ---- Stall detection wrapper ----
+# Runs yt-dlp in the background and monitors directory size every 60s.
+# If no growth is seen for STALL_TIMEOUT seconds, kills yt-dlp, waits
+# STALL_RETRY_WAIT seconds, then retries up to STALL_MAX_RETRIES times.
+# Sets global _LAST_STALLS to the number of stalls that occurred.
+run_with_stall_detection() {
+    local channel_dir="$1"
+    local max_retries="$2"
+    shift 2
+    local yt_dlp_args=("$@")
+
+    local channel_stalls=0
+    local attempt=0
+    local stalled=true  # initialize true so the while loop is entered
+    local final_exit_code=1
+
+    while $stalled && [ $attempt -lt $max_retries ]; do
+        attempt=$((attempt + 1))
+        stalled=false
+
+        [ $attempt -gt 1 ] && log "   🔄 Retry attempt $attempt/$max_retries..."
+
+        # Run yt-dlp as its own process group so we can kill all child processes
+        setsid yt-dlp "${yt_dlp_args[@]}" &
+        local YT_DLP_PID=$!
+        local stall_seconds=0
+        local last_size
+        last_size=$(du -sb "$channel_dir" 2>/dev/null | cut -f1)
+        last_size=${last_size:-0}
+
+        # Monitor loop: wake every 60s and check for progress
+        while kill -0 $YT_DLP_PID 2>/dev/null; do
+            sleep 60
+            # Process may have finished during our sleep
+            if ! kill -0 $YT_DLP_PID 2>/dev/null; then
+                break
+            fi
+
+            local current_size
+            current_size=$(du -sb "$channel_dir" 2>/dev/null | cut -f1)
+            current_size=${current_size:-0}
+
+            if [ "$current_size" -le "$last_size" ]; then
+                stall_seconds=$((stall_seconds + 60))
+                echo "   ⏸️  [$(date '+%H:%M:%S')] No progress for ${stall_seconds}s (possible rate limit)..."
+                if [ $stall_seconds -ge $STALL_TIMEOUT ]; then
+                    echo "   🛑 [$(date '+%H:%M:%S')] Stall confirmed! Killing yt-dlp, waiting ${STALL_RETRY_WAIT}s..."
+                    # Kill the entire process group (yt-dlp + ffmpeg children)
+                    kill -- -$YT_DLP_PID 2>/dev/null || kill $YT_DLP_PID 2>/dev/null
+                    wait $YT_DLP_PID 2>/dev/null
+                    channel_stalls=$((channel_stalls + 1))
+                    RATE_LIMIT_EVENTS=$((RATE_LIMIT_EVENTS + 1))
+                    stalled=true
+                    break
+                fi
+            else
+                stall_seconds=0
+                last_size=$current_size
+            fi
+        done
+
+        if ! $stalled; then
+            # yt-dlp finished naturally — capture its exit code
+            wait $YT_DLP_PID
+            final_exit_code=$?
+        elif [ $attempt -lt $max_retries ]; then
+            echo "   ⏳ [$(date '+%H:%M:%S')] Sleeping ${STALL_RETRY_WAIT}s before retry..."
+            sleep $STALL_RETRY_WAIT
+        else
+            echo "   ❌ [$(date '+%H:%M:%S')] Max retries ($max_retries) reached after $channel_stalls stall(s)"
+        fi
+    done
+
+    _LAST_STALLS=$channel_stalls
+    return $final_exit_code
+}
+
+# ---- Helper: format bytes to human-readable ----
+format_bytes() {
+    local bytes=$1
+    if [ "$bytes" -ge 1073741824 ]; then
+        awk "BEGIN {printf \"%.1f GB\", $bytes/1073741824}"
+    elif [ "$bytes" -ge 1048576 ]; then
+        awk "BEGIN {printf \"%.1f MB\", $bytes/1048576}"
+    elif [ "$bytes" -ge 1024 ]; then
+        awk "BEGIN {printf \"%.1f KB\", $bytes/1024}"
+    else
+        echo "${bytes} B"
+    fi
+}
 
 for ((i=0; i<CHANNEL_COUNT; i++)); do
     echo ""
@@ -105,52 +215,60 @@ for ((i=0; i<CHANNEL_COUNT; i++)); do
     FETCH_ONLY_NEW=$(jq -r ".channels[$i].fetch_only_new // false" "$CONFIG_FILE")
     CHANNEL_MAX_VIDEOS=$(jq -r ".channels[$i].max_videos // $MAX_VIDEOS_PER_CHANNEL" "$CONFIG_FILE")
     CHANNEL_ENABLED=$(jq -r ".channels[$i].enabled // true" "$CONFIG_FILE")
-    
+
     # Skip disabled channels
     if [ "$CHANNEL_ENABLED" = "false" ]; then
-        echo "⏭️  Skipping disabled channel: $CHANNEL_NAME_OVERRIDE"
+        log "⏭️  Skipping disabled channel: $CHANNEL_NAME_OVERRIDE"
         SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+        CH_NAMES+=("$CHANNEL_NAME_OVERRIDE")
+        CH_VIDEOS+=(0)
+        CH_STATUS+=("skipped")
+        CH_ELAPSED+=(0)
+        CH_SIZE+=("—")
+        CH_STALLS+=(0)
         continue
     fi
-    
+
     # Use custom name if provided, otherwise extract from URL
     if [ -n "$CHANNEL_NAME_OVERRIDE" ]; then
         CHANNEL_NAME="$CHANNEL_NAME_OVERRIDE"
     else
         CHANNEL_NAME=$(echo "$CHANNEL_URL" | sed 's|.*/@|@|; s|/.*||; s/[^a-zA-Z0-9._@-]/-/g')
     fi
-    
+
     # Ensure /videos tab if it's a channel URL
     if [[ "$CHANNEL_URL" =~ @[a-zA-Z0-9_-]+$ ]]; then
         CHANNEL_URL="${CHANNEL_URL}/videos"
     fi
-    
+
     CHANNEL_DIR="$ROOT_DIR/$CHANNEL_NAME"
     mkdir -p "$CHANNEL_DIR"
     ARCHIVE_FILE="$CHANNEL_DIR/downloaded.txt"
-    
-    echo "🎬 Processing: $CHANNEL_NAME"
-    echo "   📍 URL: $CHANNEL_URL"
-    
-    # Track archive size BEFORE download
+
+    logn ""
+    logn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log "🎬 [$((i+1))/$CHANNEL_COUNT] $CHANNEL_NAME"
+    log "   📍 URL: $CHANNEL_URL"
+
     ARCHIVE_LINES_BEFORE=0
     if [ -f "$ARCHIVE_FILE" ]; then
         ARCHIVE_LINES_BEFORE=$(wc -l < "$ARCHIVE_FILE" 2>/dev/null || echo 0)
-        echo "   📊 Previously downloaded: $ARCHIVE_LINES_BEFORE videos"
+        log "   📊 Previously downloaded: $ARCHIVE_LINES_BEFORE videos"
     fi
-    
-    # Create Season 01 directory for downloads
+
+    DIR_SIZE_BEFORE=$(du -sb "$CHANNEL_DIR" 2>/dev/null | cut -f1)
+    DIR_SIZE_BEFORE=${DIR_SIZE_BEFORE:-0}
+
     mkdir -p "$CHANNEL_DIR/Season 01"
-    
-    # Fetch-only-new logic
+
     if [ "$FETCH_ONLY_NEW" = "true" ] && [ -f "$ARCHIVE_FILE" ] && [ -s "$ARCHIVE_FILE" ]; then
-        echo "   🔄 Mode: Fetch-only-new (skip already downloaded)"
+        log "   🔄 Mode: fetch-only-new (break on existing)"
         BREAK_FLAG="--break-on-existing"
     else
-        echo "   📦 Mode: Initial download (max $CHANNEL_MAX_VIDEOS videos)"
+        log "   📦 Mode: initial bulk download (max $CHANNEL_MAX_VIDEOS videos)"
         BREAK_FLAG=""
     fi
-    
+
     # ---- Build OPTIMIZED yt-dlp command for SPEED ----
     YT_DLP_ARGS=(
         --yes-playlist
@@ -161,11 +279,11 @@ for ((i=0; i<CHANNEL_COUNT; i++)); do
         --format "$VIDEO_QUALITY"
         --merge-output-format mp4
         --remux-video mp4
-        --concurrent-fragments 5  # INCREASED for parallel downloading
+        --concurrent-fragments 5
         --fragment-retries 10
         --retries 10
         --retry-sleep fragment:2
-        --sleep-interval 5  # REDUCED sleep time
+        --sleep-interval 5
         --max-sleep-interval 30
         --throttled-rate 1M
         --write-info-json
@@ -178,9 +296,8 @@ for ((i=0; i<CHANNEL_COUNT; i++)); do
         --output "$OUTPUT_TEMPLATE"
         $BREAK_FLAG
         --playlist-end "$CHANNEL_MAX_VIDEOS"
-        --extractor-args "youtube:player_client=android,web"
-        --throttled-rate 1M
-        --limit-rate 10M  # INCREASED speed limit
+        --extractor-args "youtube:player_client=web,mweb"
+        --limit-rate 10M
         --force-ipv4
         --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         --referer "https://www.youtube.com/"
@@ -191,110 +308,148 @@ for ((i=0; i<CHANNEL_COUNT; i++)); do
         # --downloader aria2c
         # --downloader-args "aria2c:-x 16 -s 16 -k 1M"
     )
-    
-    # Add cookies if enabled (CRITICAL for speed)
+
     if [ "$USE_COOKIES" = "true" ]; then
         YT_DLP_ARGS+=(--cookies "$COOKIES_FILE")
-        echo "   🍪 Using cookies (important for speed)"
+        log "   🍪 Using cookies"
     else
-        echo "   ⚠️  No cookies - downloads may be slower"
+        log "   ⚠️  No cookies — downloads may be slower"
     fi
-    
-    # Add subtitle options if enabled (disabled by default for speed)
+
     if [ "$DOWNLOAD_SUBTITLES" = "true" ]; then
         YT_DLP_ARGS+=(--write-subs --sub-langs "en" --convert-subs srt --embed-subs)
-        echo "   📝 Downloading subtitles (slower)"
+        log "   📝 Subtitles enabled"
     fi
-    
-    # Add codec compatibility if forced
+
     if [ "$FORCE_CODEC_COMPATIBILITY" = "true" ]; then
         YT_DLP_ARGS+=(--recode-video mp4 --audio-codec aac --video-codec h264)
-        echo "   🔄 Forcing codec compatibility (slower)"
+        log "   🔄 Codec compatibility mode"
     fi
-    
-    # Add the channel URL
+
     YT_DLP_ARGS+=("$CHANNEL_URL")
-    
-    # ---- Execute yt-dlp command ----
+
     cd "$CHANNEL_DIR" || {
-        echo "❌ Failed to change to channel directory: $CHANNEL_DIR"
+        log "❌ Failed to change to channel directory: $CHANNEL_DIR"
         FAILED_COUNT=$((FAILED_COUNT + 1))
+        CH_NAMES+=("$CHANNEL_NAME")
+        CH_VIDEOS+=(0)
+        CH_STATUS+=("dir error")
+        CH_ELAPSED+=(0)
+        CH_SIZE+=("—")
+        CH_STALLS+=(0)
         continue
     }
-    
-    echo "   ⚡ Starting FAST download..."
-    
-    # Start timer
+
+    log "   ⚡ Starting download (stall detection: every 60s, timeout ${STALL_TIMEOUT}s)..."
     START_TIME=$(date +%s)
-    
-    # Execute yt-dlp
-    if $YT_DLP "${YT_DLP_ARGS[@]}"; then
-        DOWNLOAD_EXIT_CODE=0
-    else
-        DOWNLOAD_EXIT_CODE=$?
-    fi
-    
-    # Calculate elapsed time
+    _LAST_STALLS=0
+
+    run_with_stall_detection "$CHANNEL_DIR" "$STALL_MAX_RETRIES" "${YT_DLP_ARGS[@]}"
+    DOWNLOAD_EXIT_CODE=$?
+
     END_TIME=$(date +%s)
     ELAPSED_TIME=$((END_TIME - START_TIME))
-    
-    # Return to root directory
-    cd "$ROOT_DIR" || {
-        echo "⚠️ Warning: Could not return to root directory"
-    }
-    
+    CHANNEL_STALL_COUNT=$_LAST_STALLS
+
+    DIR_SIZE_AFTER=$(du -sb "$CHANNEL_DIR" 2>/dev/null | cut -f1)
+    DIR_SIZE_AFTER=${DIR_SIZE_AFTER:-0}
+    BYTES_DOWNLOADED=$((DIR_SIZE_AFTER - DIR_SIZE_BEFORE))
+    SIZE_LABEL=$(format_bytes "$BYTES_DOWNLOADED")
+
+    cd "$ROOT_DIR" || log "⚠️ Warning: Could not return to root directory"
+
     # ---- Post-download handling ----
     if [ $DOWNLOAD_EXIT_CODE -eq 101 ]; then
-        echo "   ⚠️  No new videos found (already downloaded)"
+        log "   ✅ Already up-to-date (no new videos)"
         SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
-        
+        CH_VIDEOS+=(0)
+        CH_STATUS+=("up-to-date")
+
     elif [ $DOWNLOAD_EXIT_CODE -ne 0 ] && [ $DOWNLOAD_EXIT_CODE -ne 101 ]; then
-        echo "   ❌ Download failed after ${ELAPSED_TIME}s (exit code: $DOWNLOAD_EXIT_CODE)"
+        log "   ❌ Download failed after $((ELAPSED_TIME/60))m$((ELAPSED_TIME%60))s (exit: $DOWNLOAD_EXIT_CODE)"
         FAILED_COUNT=$((FAILED_COUNT + 1))
-        
+        ARCHIVE_LINES_AFTER=$(wc -l < "$ARCHIVE_FILE" 2>/dev/null || echo 0)
+        CH_VIDEOS+=($((ARCHIVE_LINES_AFTER - ARCHIVE_LINES_BEFORE)))
+        CH_STATUS+=("FAILED (exit $DOWNLOAD_EXIT_CODE)")
+
         if [ "$SKIP_FAILED" = "false" ]; then
-            echo "   ⚠️  Stopping due to failure"
+            log "   ⚠️  Stopping due to failure (skip_failed_channels=false)"
+            CH_NAMES+=("$CHANNEL_NAME")
+            CH_ELAPSED+=($ELAPSED_TIME)
+            CH_SIZE+=("$SIZE_LABEL")
+            CH_STALLS+=($CHANNEL_STALL_COUNT)
             break
         fi
     else
-        # Check for new videos
         ARCHIVE_LINES_AFTER=$(wc -l < "$ARCHIVE_FILE" 2>/dev/null || echo 0)
-        if [ "$ARCHIVE_LINES_AFTER" -gt "$ARCHIVE_LINES_BEFORE" ]; then
-            NEW_VIDEOS=$((ARCHIVE_LINES_AFTER - ARCHIVE_LINES_BEFORE))
-            echo "   ✅ Success! Downloaded $NEW_VIDEOS new video(s) in ${ELAPSED_TIME}s"
+        NEW_VIDEOS=$((ARCHIVE_LINES_AFTER - ARCHIVE_LINES_BEFORE))
+
+        if [ "$NEW_VIDEOS" -gt 0 ]; then
+            log "   ✅ Downloaded $NEW_VIDEOS new video(s) | $SIZE_LABEL | $((ELAPSED_TIME/60))m$((ELAPSED_TIME%60))s"
+            [ $CHANNEL_STALL_COUNT -gt 0 ] && log "   ⚠️  Recovered from $CHANNEL_STALL_COUNT rate-limit stall(s)"
             SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
             TOTAL_NEW_VIDEOS=$((TOTAL_NEW_VIDEOS + NEW_VIDEOS))
-            
+            CH_STATUS+=("ok")
             if command -v notify-send >/dev/null 2>&1; then
                 notify-send -i face-surprise \
                     "🎉 $NEW_VIDEOS New Videos" \
-                    "Downloaded for $CHANNEL_NAME in ${ELAPSED_TIME}s"
+                    "Downloaded for $CHANNEL_NAME in $((ELAPSED_TIME/60))m$((ELAPSED_TIME%60))s"
             fi
         else
-            echo "   ℹ️  No new videos downloaded (took ${ELAPSED_TIME}s)"
+            log "   ℹ️  No new videos downloaded ($((ELAPSED_TIME/60))m$((ELAPSED_TIME%60))s)"
             SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+            CH_STATUS+=("no new videos")
         fi
+        CH_VIDEOS+=($NEW_VIDEOS)
     fi
-    
-    # Short delay between channels
+
+    CH_NAMES+=("$CHANNEL_NAME")
+    CH_ELAPSED+=($ELAPSED_TIME)
+    CH_SIZE+=("$SIZE_LABEL")
+    CH_STALLS+=($CHANNEL_STALL_COUNT)
+
     if [ $i -lt $((CHANNEL_COUNT - 1)) ]; then
-        echo "   ⏳ Waiting ${DELAY}s before next channel..."
+        log "   ⏳ Waiting ${DELAY}s before next channel..."
         sleep "$DELAY"
     fi
-    echo "   ----------------------------------------"
 done
 
-echo ""
-echo "========================================"
-echo "📊 Download Summary:"
-echo "   ✅ Successfully processed: $SUCCESS_COUNT channel(s)"
-echo "   ❌ Failed: $FAILED_COUNT channel(s)"
-echo "   ⏭️  Skipped: $SKIPPED_COUNT channel(s)"
-echo "   🎥 Total new videos: $TOTAL_NEW_VIDEOS"
-echo ""
-echo "📺 All videos saved in: $ROOT_DIR"
+RUN_END=$(date +%s)
+RUN_ELAPSED=$((RUN_END - RUN_START))
 
-# Send final notification
+# ---- Final summary ----
+logn ""
+logn "╔══════════════════════════════════════════════════════════════════════╗"
+logn "║                    📊  DOWNLOAD RUN SUMMARY                        ║"
+logn "╠══════════════════════════════════════════════════════════════════════╣"
+logn "║  Started : $RUN_TIMESTAMP                          ║"
+logn "║  Finished: $(date '+%Y-%m-%d %H:%M:%S')                          ║"
+logn "║  Duration: $((RUN_ELAPSED/60))m $((RUN_ELAPSED%60))s                                              ║"
+logn "╠══════════════════════════════════════════════════════════════════════╣"
+printf "  %-28s %7s %10s %9s %7s\n" "Channel" "Videos" "Downloaded" "Time" "Stalls"
+logn "  ──────────────────────────────────────────────────────────────────"
+for ((j=0; j<${#CH_NAMES[@]}; j++)); do
+    ch_m=$(( CH_ELAPSED[j] / 60 ))
+    ch_s=$(( CH_ELAPSED[j] % 60 ))
+    stall_col="${CH_STALLS[j]}"
+    [ "${CH_STALLS[j]}" -gt 0 ] && stall_col="⚠️  ${CH_STALLS[j]}"
+    printf "  %-28s %7s %10s  %4dm%02ds %7s  └─ %s\n" \
+        "${CH_NAMES[j]:0:28}" \
+        "${CH_VIDEOS[j]}" \
+        "${CH_SIZE[j]}" \
+        "$ch_m" "$ch_s" \
+        "$stall_col" \
+        "${CH_STATUS[j]}"
+done
+logn "  ──────────────────────────────────────────────────────────────────"
+logn "  ✅  Processed  : $SUCCESS_COUNT channel(s)"
+logn "  ❌  Failed     : $FAILED_COUNT channel(s)"
+logn "  ⏭️   Skipped    : $SKIPPED_COUNT channel(s)"
+logn "  🎥  New videos : $TOTAL_NEW_VIDEOS"
+logn "  🛑  Rate limits: $RATE_LIMIT_EVENTS stall event(s)"
+logn "  📁  Saved in   : $ROOT_DIR"
+logn "╚══════════════════════════════════════════════════════════════════════╝"
+
 if command -v notify-send >/dev/null 2>&1; then
     if [ $FAILED_COUNT -eq 0 ] && [ $TOTAL_NEW_VIDEOS -gt 0 ]; then
         notify-send -i face-smile \
@@ -307,6 +462,6 @@ if command -v notify-send >/dev/null 2>&1; then
     else
         notify-send -i dialog-warning \
             "⚠️ YouTube Download Issues" \
-            "$FAILED_COUNT channels failed"
+            "$FAILED_COUNT channel(s) failed | $RATE_LIMIT_EVENTS rate-limit event(s)"
     fi
 fi

@@ -1,3 +1,13 @@
 # Docker environment files
 .env
 secrets.env
+
+# User-specific config (use config.json (copy).template as a starting point)
+config.json
+
+# YouTube auth cookies — never commit real session tokens
+cookies.txt
+
+# Runtime logs
+*.log
+download.log
