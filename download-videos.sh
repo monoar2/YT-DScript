@@ -208,6 +208,67 @@ format_bytes() {
     fi
 }
 
+# ---- Generate tvshow.nfo for Jellyfin YouTube metadata plugin ----
+# Reads channel_id and title from the first available episode .info.json.
+# The ankenyr Jellyfin plugin uses <uniqueid type="youtube"> to fetch channel art.
+generate_channel_metadata() {
+    local channel_dir="$1"
+    local channel_name="$2"
+    local nfo_file="$channel_dir/tvshow.nfo"
+
+    [ -f "$nfo_file" ] && return 0  # already exists, skip
+
+    local info_json
+    info_json=$(find "$channel_dir/Season 01" -name "*.info.json" 2>/dev/null | head -1)
+    [ -z "$info_json" ] && return 0
+
+    local ch_title ch_id
+    ch_title=$(jq -r '.channel // .uploader // ""' "$info_json")
+    ch_id=$(jq -r '.channel_id // ""' "$info_json")
+
+    [ -z "$ch_id" ] && return 0
+
+    log "   📄 Writing tvshow.nfo (channel_id: $ch_id)..."
+    cat > "$nfo_file" <<EOF
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<tvshow>
+    <title>${ch_title}</title>
+    <sorttitle>${ch_title}</sorttitle>
+    <uniqueid type="youtube" default="true">${ch_id}</uniqueid>
+    <plot>YouTube channel: ${ch_title}</plot>
+    <studio>YouTube</studio>
+    <tag>YouTube</tag>
+</tvshow>
+EOF
+}
+
+# ---- Remove sidecar files that have no matching video file ----
+cleanup_orphan_sidecars() {
+    local season_dir="$1"
+    [ ! -d "$season_dir" ] && return 0
+
+    local count=0
+    while IFS= read -r sidecar; do
+        local base
+        case "$sidecar" in
+            *.info.json)  base="${sidecar%.info.json}" ;;
+            *.description) base="${sidecar%.description}" ;;
+            *.webp)       base="${sidecar%.webp}" ;;
+            *.jpg)        base="${sidecar%.jpg}" ;;
+            *)            continue ;;
+        esac
+        # Keep sidecar if any video format with same stem exists
+        if ! compgen -G "${base}.mp4" "${base}.mkv" "${base}.webm" "${base}.avi" > /dev/null 2>&1; then
+            rm -f "$sidecar"
+            count=$((count + 1))
+        fi
+    done < <(find "$season_dir" -maxdepth 1 \
+        \( -name "*.info.json" -o -name "*.description" -o -name "*.webp" -o -name "*.jpg" \) \
+        2>/dev/null)
+
+    [ "$count" -gt 0 ] && log "   🧹 Removed $count orphan sidecar file(s) from $(basename "$season_dir")"
+}
+
 for ((i=0; i<CHANNEL_COUNT; i++)); do
     echo ""
     CHANNEL_URL=$(jq -r ".channels[$i].url" "$CONFIG_FILE")
@@ -289,6 +350,7 @@ for ((i=0; i<CHANNEL_COUNT; i++)); do
         --write-info-json
         --write-description
         --write-thumbnail
+        --convert-thumbnails jpg
         --embed-thumbnail
         --embed-metadata
         --add-metadata
@@ -357,6 +419,10 @@ for ((i=0; i<CHANNEL_COUNT; i++)); do
     SIZE_LABEL=$(format_bytes "$BYTES_DOWNLOADED")
 
     cd "$ROOT_DIR" || log "⚠️ Warning: Could not return to root directory"
+
+    # ---- Post-download: Jellyfin metadata & sidecar cleanup ----
+    generate_channel_metadata "$CHANNEL_DIR" "$CHANNEL_NAME"
+    cleanup_orphan_sidecars "$CHANNEL_DIR/Season 01"
 
     # ---- Post-download handling ----
     if [ $DOWNLOAD_EXIT_CODE -eq 101 ]; then
